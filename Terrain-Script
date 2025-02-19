@@ -1,0 +1,210 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import geopandas as gpd
+import rasterio
+import rasterio.mask
+from rasterio.transform import from_origin
+import srtm
+from shapely.geometry import mapping
+from mpl_toolkits.mplot3d import Axes3D  # for 3D plotting
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+OUTPUT_DIR = r"Path to your Directory"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Path to the KP shapefile
+kpk_shp_path = r"Path to your shapefile"
+
+# Resolution (degrees) for SRTM sampling
+step = 0.005
+
+# Sun angles for hillshade
+azimuth_deg = 315
+altitude_deg = 45
+
+# -----------------------------------------------------------------------------
+# Step 1: Load KP Shapefile and Determine Bounding Box
+# -----------------------------------------------------------------------------
+kpk_gdf = gpd.read_file(kpk_shp_path)
+print("Loaded KP shapefile. CRS:", kpk_gdf.crs)
+
+minx, miny, maxx, maxy = kpk_gdf.total_bounds
+print("KP Bounding Box:", (minx, miny, maxx, maxy))
+
+# -----------------------------------------------------------------------------
+# Step 2: Create a DEM over the Bounding Box with SRTM
+# -----------------------------------------------------------------------------
+lon_vals = np.arange(minx, maxx, step)
+lat_vals = np.arange(maxy, miny, -step)
+n_rows = len(lat_vals)
+n_cols = len(lon_vals)
+
+print(f"DEM grid size: {n_rows} rows x {n_cols} cols")
+
+dem_array = np.empty((n_rows, n_cols), dtype=np.float32)
+dem_data = srtm.get_data()
+
+for i, lat in enumerate(lat_vals):
+    for j, lon in enumerate(lon_vals):
+        elevation = dem_data.get_elevation(lat, lon)
+        if elevation is None:
+            elevation = np.nan
+        dem_array[i, j] = elevation
+
+transform = from_origin(minx, maxy, step, step)
+
+dem_tif = os.path.join(OUTPUT_DIR, "KP_DEM.tif")
+with rasterio.open(
+    dem_tif, "w",
+    driver="GTiff",
+    height=n_rows,
+    width=n_cols,
+    count=1,
+    dtype=dem_array.dtype,
+    crs="EPSG:4326",
+    transform=transform
+) as dst:
+    dst.write(dem_array, 1)
+
+print("DEM saved as:", dem_tif)
+
+# -----------------------------------------------------------------------------
+# Step 3: Mask the DEM to the KP Polygon
+# -----------------------------------------------------------------------------
+with rasterio.open(dem_tif) as src:
+    geoms = [mapping(geom) for geom in kpk_gdf.geometry]
+    out_image, out_transform = rasterio.mask.mask(
+        src, geoms, crop=True, filled=True, nodata=np.nan
+    )
+    masked_dem = out_image[0]
+    masked_meta = src.meta.copy()
+    masked_meta.update({
+        "height": masked_dem.shape[0],
+        "width": masked_dem.shape[1],
+        "transform": out_transform,
+        "nodata": np.nan
+    })
+
+masked_dem_tif = os.path.join(OUTPUT_DIR, "KP_DEM_masked.tif")
+with rasterio.open(masked_dem_tif, "w", **masked_meta) as dst:
+    dst.write(masked_dem, 1)
+
+print("Masked DEM saved as:", masked_dem_tif)
+
+# -----------------------------------------------------------------------------
+# Step 4: Compute Hillshade from the Masked DEM
+# -----------------------------------------------------------------------------
+# Extract resolution from the transform
+res_x = out_transform[0]
+res_y = abs(out_transform[4])  # typically negative in north-up
+dy, dx = np.gradient(masked_dem, res_y, res_x)
+
+slope = np.pi / 2.0 - np.arctan(np.sqrt(dx**2 + dy**2))
+aspect = np.arctan2(-dx, dy)
+
+azimuth_rad = np.radians(azimuth_deg)
+altitude_rad = np.radians(altitude_deg)
+
+hillshade = (np.sin(altitude_rad) * np.sin(slope) +
+             np.cos(altitude_rad) * np.cos(slope) *
+             np.cos(azimuth_rad - aspect))
+hillshade = np.clip(hillshade, 0, 1)
+
+# -----------------------------------------------------------------------------
+# Step 5: Create a 2D Colored DEM + Hillshade Map
+# -----------------------------------------------------------------------------
+rows, cols = masked_dem.shape
+
+# Build extent for imshow
+x_min = out_transform[2]
+x_max = x_min + cols * res_x
+y_max = out_transform[5]
+y_min = y_max + rows * out_transform[4]
+extent = (x_min, x_max, y_min, y_max)
+
+dem_min, dem_max = np.nanmin(masked_dem), np.nanmax(masked_dem)
+norm = plt.Normalize(vmin=dem_min, vmax=dem_max)
+
+# Create colored DEM
+colored_dem = plt.cm.terrain(norm(masked_dem.copy()))
+
+# Blend with hillshade
+for i in range(3):  # R, G, B channels
+    colored_dem[..., i] *= hillshade
+
+fig, ax = plt.subplots(figsize=(8, 8))
+im = ax.imshow(colored_dem, extent=extent, origin='upper')
+ax.set_title("2D Colored DEM with Hillshade (KP)", fontsize=14)
+ax.set_xlabel("Longitude", fontsize=11)
+ax.set_ylabel("Latitude", fontsize=11)
+
+# Add a colorbar for elevation
+mappable_2d = plt.cm.ScalarMappable(norm=norm, cmap=plt.cm.terrain)
+mappable_2d.set_array([])
+cbar_2d = plt.colorbar(mappable_2d, ax=ax, shrink=0.6, pad=0.05)
+cbar_2d.set_label("Elevation (m)", fontsize=12)
+
+colored_hillshade_png = os.path.join(OUTPUT_DIR, "KP_Colored_Hillshade.png")
+plt.savefig(colored_hillshade_png, dpi=300, bbox_inches="tight")
+plt.close()
+print("2D Colored DEM + Hillshade map saved as:", colored_hillshade_png)
+
+
+
+# -----------------------------------------------------------------------------
+# Step 6: Create 3D Terrain Visualization
+# -----------------------------------------------------------------------------
+# Create coordinate grids for 3D plotting
+y, x = np.mgrid[0:masked_dem.shape[0], 0:masked_dem.shape[1]]
+
+# Convert grid coordinates to geographic coordinates
+lon = x * res_x + out_transform[2]
+lat = y * res_y + out_transform[5]
+
+# Clean up the DEM data
+masked_dem_3d = np.nan_to_num(masked_dem, nan=0)
+
+# Create figure and 3D axis
+fig = plt.figure(figsize=(15, 12))
+ax = fig.add_subplot(111, projection='3d')
+
+# Plot the surface
+surf = ax.plot_surface(
+    lon, lat, masked_dem_3d,
+    cmap='terrain',
+    norm=norm,
+    rstride=1, 
+    cstride=1,
+    linewidth=0,
+    antialiased=True,
+    shade=True
+)
+
+# Improve the appearance
+ax.set_facecolor('white')
+
+# Create a colorbar
+cb = fig.colorbar(surf, ax=ax, shrink=0.5, aspect=5)
+cb.set_label('Elevation (m)', fontsize=12)
+
+# Set labels and title
+ax.set_title("3D Terrain of Khyber Pakhtunkhwa (KP)", fontsize=14, pad=20)
+ax.set_xlabel("Longitude", fontsize=11)
+ax.set_ylabel("Latitude", fontsize=11)
+ax.set_zlabel("Elevation (m)", fontsize=11)
+
+# Set view angle to show northern elevations properly
+ax.view_init(elev=30, azim=135)
+
+# Make sure north is properly oriented
+ax.invert_yaxis()
+
+# Save the figure
+terrain_3d_png = os.path.join(OUTPUT_DIR, "KP_3D_Terrain.png")
+plt.savefig(terrain_3d_png, dpi=300, bbox_inches="tight", facecolor='white')
+plt.close()
+
+print("3D Terrain map saved as:", terrain_3d_png)
